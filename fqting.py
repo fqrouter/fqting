@@ -162,7 +162,7 @@ def handle_packet(nfqueue_element):
 def handle_syn(ip_packet):
     if ip_packet.dst_ip in probe_results:
         probe_result = probe_results[ip_packet.dst_ip]
-        if time.time() - pre_result.started_at < 10:
+        if time.time() - probe_result.started_at < 10:
             return
     if ip_packet.dst_ip in to_gfw_ttls:
         return
