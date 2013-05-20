@@ -114,9 +114,6 @@ def handle_packet(nfqueue_element):
         ip_packet.nfqueue_element = nfqueue_element
         ip_packet.src_ip = socket.inet_ntoa(ip_packet.src)
         ip_packet.dst_ip = socket.inet_ntoa(ip_packet.dst)
-        if fqsocks.china_ip.is_china_ip(ip_packet.dst_ip):
-            nfqueue_element.accept()
-            return
         if fqsocks.lan_ip.is_lan_traffic(ip_packet.src_ip, ip_packet.dst_ip):
             nfqueue_element.accept()
             return
@@ -126,23 +123,25 @@ def handle_packet(nfqueue_element):
                 nfqueue_element.accept()
                 return
             if dpkt.tcp.TH_SYN == ip_packet.tcp.flags:
-                handle_syn(ip_packet)
+                if not fqsocks.china_ip.is_china_ip(ip_packet.dst_ip):
+                    handle_syn(ip_packet)
                 nfqueue_element.accept()
                 return
             if dpkt.tcp.TH_RST & ip_packet.tcp.flags:
                 handle_rst(ip_packet)
                 nfqueue_element.accept()
                 return
-            if (ip_packet.dst_ip, ip_packet.tcp.seq) in buffered_http_requests:
-                handle_http_request(buffered_http_requests[(ip_packet.dst_ip, ip_packet.tcp.seq)])
-                nfqueue_element.drop()
-                return
-            pos_host = ip_packet.tcp.data.find('Host:')
-            if pos_host != -1:
-                ip_packet.pos_host = pos_host + len('Host')
-                handle_http_request(ip_packet)
-                nfqueue_element.drop()
-                return
+            if not fqsocks.china_ip.is_china_ip(ip_packet.dst_ip):
+                if (ip_packet.dst_ip, ip_packet.tcp.seq) in buffered_http_requests:
+                    handle_http_request(buffered_http_requests[(ip_packet.dst_ip, ip_packet.tcp.seq)])
+                    nfqueue_element.drop()
+                    return
+                pos_host = ip_packet.tcp.data.find('Host:')
+                if pos_host != -1:
+                    ip_packet.pos_host = pos_host + len('Host')
+                    handle_http_request(ip_packet)
+                    nfqueue_element.drop()
+                    return
         elif hasattr(ip_packet, 'icmp'):
             icmp_packet = ip_packet.data
             if dpkt.icmp.ICMP_TIMEXCEED == icmp_packet.type and dpkt.icmp.ICMP_TIMEXCEED_INTRANS == icmp_packet.code:
@@ -163,7 +162,7 @@ def handle_packet(nfqueue_element):
 def handle_syn(ip_packet):
     if ip_packet.dst_ip in probe_results:
         probe_result = probe_results[ip_packet.dst_ip]
-        if time.time() - probe_result.started_at < 10:
+        if time.time() - pre_result.started_at < 10:
             return
     if ip_packet.dst_ip in to_gfw_ttls:
         return
