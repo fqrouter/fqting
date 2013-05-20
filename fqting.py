@@ -19,7 +19,8 @@ MIN_TTL_TO_GFW = 8
 MAX_TTL_TO_GFW = 14
 RANGE_OF_TTL_TO_GFW = range(MIN_TTL_TO_GFW, MAX_TTL_TO_GFW + 1)
 probe_results = {}
-probed_ttls = {} # ip => ttl
+to_gfw_ttls = {} # ip => ttl
+syn_ack_ttls = {} # ip => ttl
 buffered_http_requests = {} # (ip, seq) => ip_packet
 scrambled_ips = []
 
@@ -27,6 +28,10 @@ scrambled_ips = []
 def setup_development_env():
     subprocess.check_call(
         'iptables -I OUTPUT -p tcp --tcp-flags ALL SYN -j NFQUEUE', shell=True)
+    subprocess.check_call(
+        'iptables -I INPUT -p tcp --tcp-flags ALL SYN,ACK -j NFQUEUE', shell=True)
+    subprocess.check_call(
+        'iptables -I INPUT -p tcp --tcp-flags ALL RST -j NFQUEUE', shell=True)
     subprocess.check_call(
         'iptables -I INPUT -p icmp -j NFQUEUE', shell=True)
     subprocess.check_call(
@@ -36,6 +41,10 @@ def setup_development_env():
 def teardown_development_env():
     subprocess.check_call(
         'iptables -D OUTPUT -p tcp --tcp-flags ALL SYN -j NFQUEUE', shell=True)
+    subprocess.check_call(
+        'iptables -D INPUT -p tcp --tcp-flags ALL SYN,ACK -j NFQUEUE', shell=True)
+    subprocess.check_call(
+        'iptables -D INPUT -p tcp --tcp-flags ALL RST -j NFQUEUE', shell=True)
     subprocess.check_call(
         'iptables -D INPUT -p icmp -j NFQUEUE', shell=True)
     subprocess.check_call(
@@ -103,8 +112,16 @@ def handle_packet(nfqueue_element):
             nfqueue_element.accept()
             return
         if hasattr(ip_packet, 'tcp'):
+            if dpkt.tcp.TH_SYN & ip_packet.tcp.flags and dpkt.tcp.TH_ACK & ip_packet.tcp.flags:
+                handle_syn_ack(ip_packet)
+                nfqueue_element.accept()
+                return
             if dpkt.tcp.TH_SYN == ip_packet.tcp.flags:
                 handle_syn(ip_packet)
+                nfqueue_element.accept()
+                return
+            if dpkt.tcp.TH_RST & ip_packet.tcp.flags:
+                handle_rst(ip_packet)
                 nfqueue_element.accept()
                 return
             if (ip_packet.dst_ip, ip_packet.tcp.seq) in buffered_http_requests:
@@ -133,7 +150,7 @@ def handle_packet(nfqueue_element):
 def handle_syn(ip_packet):
     if ip_packet.dst_ip in probe_results:
         return
-    if ip_packet.dst_ip in probed_ttls:
+    if ip_packet.dst_ip in to_gfw_ttls:
         return
     inject_ping_requests_to_find_right_ttl(ip_packet.dst_ip)
 
@@ -203,7 +220,7 @@ def handle_time_exceeded(ip_packet):
         return
     te_ip_packet = time_exceed.data
     dst_ip = socket.inet_ntoa(te_ip_packet.dst)
-    if dst_ip in probed_ttls:
+    if dst_ip in to_gfw_ttls:
         return
     if not isinstance(te_ip_packet.data, dpkt.icmp.ICMP):
         return
@@ -222,7 +239,7 @@ def handle_time_exceeded(ip_packet):
     if not ttl_to_gfw:
         return
     LOGGER.info('found ttl to gfw: %s %s' % (dst_ip, ttl_to_gfw))
-    probed_ttls[dst_ip] = ttl_to_gfw
+    to_gfw_ttls[dst_ip] = ttl_to_gfw
     probe_results.pop(dst_ip, None)
     if ttl_to_gfw == MAX_TTL_TO_GFW:
         MIN_TTL_TO_GFW += 2
@@ -233,7 +250,7 @@ def handle_time_exceeded(ip_packet):
 # === HTTP REQUEST: buffer or scramble ===
 
 def handle_http_request(ip_packet):
-    ttl_to_gfw = probed_ttls.get(ip_packet.dst_ip)
+    ttl_to_gfw = to_gfw_ttls.get(ip_packet.dst_ip)
     if not ttl_to_gfw:
         buffered_http_requests[(ip_packet.dst_ip, ip_packet.tcp.seq)] = ip_packet
         return
@@ -286,6 +303,25 @@ def inject_scrambled_http_get_to_let_gfw_miss_keyword(ip_packet, pos_host, ttl_t
     first_packet.sum = 0
     first_packet.tcp.sum = 0
     raw_socket.sendto(str(first_packet), (ip_packet.dst_ip, 0))
+
+# === RST: assess the effectiveness ===
+
+def handle_syn_ack(ip_packet):
+    expected_ttl = syn_ack_ttls.get((ip_packet.src_ip, ip_packet.tcp.dport)) or 0
+    if expected_ttl and abs(ip_packet.ttl - expected_ttl) > 2:
+        LOGGER.error(
+            'received spoofed SYN ACK: %s expected ttl is %s, actually is %s' %
+            (ip_packet.src_ip, expected_ttl, ip_packet.ttl))
+        # later one should be the correct one as GFW is closer to us
+    syn_ack_ttls[(ip_packet.src_ip, ip_packet.tcp.dport)] = ip_packet.ttl
+
+
+def handle_rst(ip_packet):
+    expected_ttl = syn_ack_ttls.get((ip_packet.src_ip, ip_packet.tcp.dport)) or 0
+    if expected_ttl and abs(ip_packet.ttl - expected_ttl) > 2:
+        LOGGER.error(
+            'received RST from GFW: %s expected ttl is %s, actually is %s' %
+            (ip_packet.src_ip, expected_ttl, ip_packet.ttl))
 
 
 if '__main__' == __name__:
