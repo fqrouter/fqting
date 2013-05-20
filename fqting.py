@@ -251,11 +251,24 @@ def handle_time_exceeded(ip_packet):
 
 def handle_http_request(ip_packet):
     ttl_to_gfw = to_gfw_ttls.get(ip_packet.dst_ip)
-    if not ttl_to_gfw:
-        buffered_http_requests[(ip_packet.dst_ip, ip_packet.tcp.seq)] = ip_packet
-        return
-    buffered_http_requests.pop((ip_packet.dst_ip, ip_packet.tcp.seq), None)
-    inject_scrambled_http_get_to_let_gfw_miss_keyword(ip_packet, ip_packet.pos_host, ttl_to_gfw)
+    buffer_key = (ip_packet.dst_ip, ip_packet.tcp.seq)
+    if ttl_to_gfw:
+        buffered_http_requests.pop(buffer_key, None)
+        inject_scrambled_http_get_to_let_gfw_miss_keyword(ip_packet, ip_packet.pos_host, ttl_to_gfw)
+    else:
+        if buffer_key in buffered_http_requests:
+            buffered_at = buffered_http_requests[buffer_key].buffered_at
+            if time.time() - buffered_at > 1:
+                probe_result = probe_results.get(ip_packet.dst_ip)
+                ttl_to_gfw = probe_result.analyze_ttl_to_gfw(exact_match_only=False) if probe_result else None
+                ttl_to_gfw = ttl_to_gfw or int((MAX_TTL_TO_GFW + MIN_TTL_TO_GFW ) / 2)
+                to_gfw_ttls[ip_packet.dst_ip] = ttl_to_gfw
+                LOGGER.error('buffered http request timed out, guess ttl: %s %s' % (ip_packet.dst_ip, ttl_to_gfw))
+                buffered_http_requests.pop(buffer_key, None)
+                inject_scrambled_http_get_to_let_gfw_miss_keyword(ip_packet, ip_packet.pos_host, ttl_to_gfw)
+        else:
+            ip_packet.buffered_at = time.time()
+            buffered_http_requests[buffer_key] = ip_packet
 
 
 def inject_scrambled_http_get_to_let_gfw_miss_keyword(ip_packet, pos_host, ttl_to_gfw):
