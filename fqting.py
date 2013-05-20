@@ -35,6 +35,8 @@ def setup_development_env():
     subprocess.check_call(
         'iptables -I INPUT -p icmp -j NFQUEUE', shell=True)
     subprocess.check_call(
+        'iptables -I INPUT -p udp --sport 53 --dport 1 -j NFQUEUE', shell=True)
+    subprocess.check_call(
         'iptables -I OUTPUT -p tcp -m mark --mark 0xbabe -j NFQUEUE', shell=True)
 
 
@@ -48,6 +50,8 @@ def teardown_development_env():
     subprocess.check_call(
         'iptables -D INPUT -p icmp -j NFQUEUE', shell=True)
     subprocess.check_call(
+        'iptables -D INPUT -p udp --sport 53 --dport 1 -j NFQUEUE', shell=True)
+    subprocess.check_call(
         'iptables -D OUTPUT -p tcp -m mark --mark 0xbabe -j NFQUEUE', shell=True)
 
 
@@ -55,16 +59,19 @@ raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
 atexit.register(raw_socket.close)
 raw_socket.setsockopt(socket.SOL_IP, socket.IP_HDRINCL, 1)
 SO_MARK = 36
-raw_socket.setsockopt(socket.SOL_SOCKET, SO_MARK, 0xcafe)
+NO_PROCESSING_MARK = None
+DNS_REQUEST_SPORT = 1
+DNS_REQUEST_DPORT = 53
 
 
 def main():
-    global DEFAULT_VERDICT
+    global NO_PROCESSING_MARK
     argument_parser = argparse.ArgumentParser()
     argument_parser.add_argument('--log-file')
     argument_parser.add_argument('--log-level', choices=['INFO', 'DEBUG'], default='INFO')
     argument_parser.add_argument('--queue-number', default=0, type=int)
     argument_parser.add_argument('--dev', action='store_true')
+    argument_parser.add_argument('--mark', default='0xcafe')
     args = argument_parser.parse_args()
     log_level = getattr(logging, args.log_level)
     logging.basicConfig(stream=sys.stdout, level=log_level, format='%(asctime)s %(levelname)s %(message)s')
@@ -79,6 +86,8 @@ def main():
         signal.signal(signal.SIGINT, lambda signum, fame: teardown_development_env())
         atexit.register(teardown_development_env)
         setup_development_env()
+    NO_PROCESSING_MARK = eval(args.mark)
+    raw_socket.setsockopt(socket.SOL_SOCKET, SO_MARK, NO_PROCESSING_MARK)
     handle_nfqueue(args.queue_number)
 
 
@@ -98,7 +107,7 @@ def handle_nfqueue(queue_number):
 
 def handle_packet(nfqueue_element):
     try:
-        if 0xcafe == nfqueue_element.get_mark():
+        if NO_PROCESSING_MARK == nfqueue_element.get_mark():
             nfqueue_element.accept()
             return
         ip_packet = dpkt.ip.IP(nfqueue_element.get_payload())
@@ -140,6 +149,10 @@ def handle_packet(nfqueue_element):
                 handle_time_exceeded(ip_packet)
                 nfqueue_element.accept()
                 return
+        elif hasattr(ip_packet, 'udp'):
+            handle_dns_response(ip_packet)
+            nfqueue_element.drop()
+            return
         nfqueue_element.accept()
     except:
         LOGGER.exception('failed to handle packet')
@@ -152,21 +165,39 @@ def handle_syn(ip_packet):
         return
     if ip_packet.dst_ip in to_gfw_ttls:
         return
-    inject_ping_requests_to_find_right_ttl(ip_packet.dst_ip)
-
-
-def inject_ping_requests_to_find_right_ttl(dst_ip):
-    probe_results[dst_ip] = ProbeResult()
+    probe_results[ip_packet.dst_ip] = ProbeResult()
     if LOGGER.isEnabledFor(logging.DEBUG):
-        LOGGER.debug('inject ping request: %s %s' % (dst_ip, RANGE_OF_TTL_TO_GFW))
+        LOGGER.debug('probe ttl: %s %s' % (ip_packet.dst_ip, RANGE_OF_TTL_TO_GFW))
+    probe_src = find_probe_src(ip_packet.dst_ip)
+    inject_ping_requests_to_find_right_ttl(ip_packet.dst_ip, probe_src)
+    inject_dns_requests_to_find_right_ttl(ip_packet.dst_ip, probe_src)
+
+
+def inject_ping_requests_to_find_right_ttl(dst_ip, probe_src):
     for ttl in RANGE_OF_TTL_TO_GFW:
         icmp_packet = dpkt.icmp.ICMP(type=dpkt.icmp.ICMP_ECHO, data=dpkt.icmp.ICMP.Echo(id=ttl, seq=1, data=''))
         ip_packet = dpkt.ip.IP(
-            src=socket.inet_aton(find_probe_src(dst_ip)),
+            src=socket.inet_aton(probe_src),
             dst=socket.inet_aton(dst_ip),
             p=dpkt.ip.IP_PROTO_ICMP)
         ip_packet.ttl = ttl
         ip_packet.data = icmp_packet
+        raw_socket.sendto(str(ip_packet), (dst_ip, 0))
+
+
+def inject_dns_requests_to_find_right_ttl(dst_ip, probe_src):
+    for ttl in RANGE_OF_TTL_TO_GFW:
+        dns_packet = dpkt.dns.DNS(id=ttl, qd=[dpkt.dns.DNS.Q(name='plus.google.com', type=dpkt.dns.DNS_A)])
+        udp_packet = dpkt.udp.UDP(sport=DNS_REQUEST_SPORT, dport=DNS_REQUEST_DPORT)
+        udp_packet.data = dns_packet
+        udp_packet.ulen = len(udp_packet)
+        ip_packet = dpkt.ip.IP(
+            src=socket.inet_aton(probe_src),
+            dst=socket.inet_aton(dst_ip),
+            p=dpkt.ip.IP_PROTO_UDP)
+        ip_packet.ttl = ttl
+        ip_packet.data = udp_packet
+        ip_packet.len = len(ip_packet)
         raw_socket.sendto(str(ip_packet), (dst_ip, 0))
 
 
@@ -184,6 +215,7 @@ class ProbeResult(object):
         super(ProbeResult, self).__init__()
         self.started_at = time.time()
         self.routers = {} # ttl => (router_ip, is_china_router)
+        self.wrong_dns_answers = {} # ttl => count
 
     def analyze_ttl_to_gfw(self, exact_match_only=True):
         max_china_ttl = None
@@ -207,9 +239,13 @@ class ProbeResult(object):
         if exact_match_only:
             return None
         else:
-            return max_china_ttl
+            if max_china_ttl:
+                return max_china_ttl
+            if self.wrong_dns_answers:
+                return min(self.wrong_dns_answers.keys()) + 3 # GFW normally distribute within 3 hops
+            return None
 
-# === ICMP TIME EXCEED: analyze probe results, find ttl to gfw ===
+# === ICMP TIME EXCEED/DNS RESPONSE: analyze probe results, find ttl to gfw ===
 
 def handle_time_exceeded(ip_packet):
     global MAX_TTL_TO_GFW
@@ -247,6 +283,15 @@ def handle_time_exceeded(ip_packet):
         LOGGER.info('slide ttl range to [%s ~ %s]' % (MIN_TTL_TO_GFW, MAX_TTL_TO_GFW))
         RANGE_OF_TTL_TO_GFW = range(MIN_TTL_TO_GFW, MAX_TTL_TO_GFW + 1)
 
+
+def handle_dns_response(ip_packet):
+    probe_result = probe_results.get(ip_packet.src_ip)
+    if not probe_result:
+        return
+    dns_packet = dpkt.dns.DNS(ip_packet.udp.data)
+    ttl = dns_packet.id
+    probe_result.wrong_dns_answers[ttl] = probe_result.wrong_dns_answers.get(ttl, 0) + 1
+
 # === HTTP REQUEST: buffer or scramble ===
 
 def handle_http_request(ip_packet):
@@ -259,8 +304,12 @@ def handle_http_request(ip_packet):
         if buffer_key in buffered_http_requests:
             buffered_at = buffered_http_requests[buffer_key].buffered_at
             if time.time() - buffered_at > 1:
-                probe_result = probe_results.get(ip_packet.dst_ip)
-                ttl_to_gfw = probe_result.analyze_ttl_to_gfw(exact_match_only=False) if probe_result else None
+                probe_result = probe_results.pop(ip_packet.dst_ip, None)
+                if probe_result:
+                    ttl_to_gfw = probe_result.analyze_ttl_to_gfw(exact_match_only=False)
+                    LOGGER.info('probe result: %s, %s' % (probe_result.routers, probe_result.wrong_dns_answers))
+                else:
+                    ttl_to_gfw = None
                 ttl_to_gfw = ttl_to_gfw or int((MAX_TTL_TO_GFW + MIN_TTL_TO_GFW ) / 2)
                 to_gfw_ttls[ip_packet.dst_ip] = ttl_to_gfw
                 LOGGER.error('buffered http request timed out, guess ttl: %s %s' % (ip_packet.dst_ip, ttl_to_gfw))
