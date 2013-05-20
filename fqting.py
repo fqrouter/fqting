@@ -20,6 +20,8 @@ MAX_TTL_TO_GFW = 14
 RANGE_OF_TTL_TO_GFW = range(MIN_TTL_TO_GFW, MAX_TTL_TO_GFW + 1)
 probe_results = {}
 probed_ttls = {} # ip => ttl
+buffered_http_requests = {} # (ip, seq) => ip_packet
+scrambled_ips = []
 
 
 def setup_development_env():
@@ -87,6 +89,9 @@ def handle_nfqueue(queue_number):
 
 def handle_packet(nfqueue_element):
     try:
+        if 0xcafe == nfqueue_element.get_mark():
+            nfqueue_element.accept()
+            return
         ip_packet = dpkt.ip.IP(nfqueue_element.get_payload())
         ip_packet.nfqueue_element = nfqueue_element
         ip_packet.src_ip = socket.inet_ntoa(ip_packet.src)
@@ -102,6 +107,16 @@ def handle_packet(nfqueue_element):
                 handle_syn(ip_packet)
                 nfqueue_element.accept()
                 return
+            if (ip_packet.dst_ip, ip_packet.tcp.seq) in buffered_http_requests:
+                handle_http_request(buffered_http_requests[(ip_packet.dst_ip, ip_packet.tcp.seq)])
+                nfqueue_element.drop()
+                return
+            pos_host = ip_packet.tcp.data.find('Host:')
+            if pos_host != -1:
+                ip_packet.pos_host = pos_host + len('Host')
+                handle_http_request(ip_packet)
+                nfqueue_element.drop()
+                return
         elif hasattr(ip_packet, 'icmp'):
             icmp_packet = ip_packet.data
             if dpkt.icmp.ICMP_TIMEXCEED == icmp_packet.type and dpkt.icmp.ICMP_TIMEXCEED_INTRANS == icmp_packet.code:
@@ -114,13 +129,16 @@ def handle_packet(nfqueue_element):
         nfqueue_element.accept()
 
 
+# === SYN: probe ttl to gfw ===
 def handle_syn(ip_packet):
+    if ip_packet.dst_ip in probe_results:
+        return
+    if ip_packet.dst_ip in probed_ttls:
+        return
     inject_ping_requests_to_find_right_ttl(ip_packet.dst_ip)
 
 
 def inject_ping_requests_to_find_right_ttl(dst_ip):
-    if dst_ip in probe_results:
-        return
     probe_results[dst_ip] = ProbeResult()
     if LOGGER.isEnabledFor(logging.DEBUG):
         LOGGER.debug('inject ping request: %s %s' % (dst_ip, RANGE_OF_TTL_TO_GFW))
@@ -143,6 +161,38 @@ def find_probe_src(dst_ip):
     finally:
         s.close()
 
+
+class ProbeResult(object):
+    def __init__(self):
+        super(ProbeResult, self).__init__()
+        self.started_at = time.time()
+        self.routers = {} # ttl => (router_ip, is_china_router)
+
+    def analyze_ttl_to_gfw(self, exact_match_only=True):
+        max_china_ttl = None
+        if self.routers.get(MAX_TTL_TO_GFW):
+            router_ip, is_china_router = self.routers.get(MAX_TTL_TO_GFW)
+            if is_china_router:
+                LOGGER.info('max ttl is still in china: %s, %s' % (MAX_TTL_TO_GFW, router_ip))
+                return MAX_TTL_TO_GFW
+        for ttl in sorted(self.routers.keys()):
+            next = self.routers.get(ttl + 1)
+            if next is None:
+                continue
+                # ttl 8 is china, ttl 9 is not
+            _, current_is_china_router = self.routers[ttl]
+            _, next_is_china_router = next
+            # then we think 8 is the ttl to gfw
+            if current_is_china_router:
+                max_china_ttl = ttl
+                if not next_is_china_router:
+                    return ttl
+        if exact_match_only:
+            return None
+        else:
+            return max_china_ttl
+
+# === ICMP TIME EXCEED: analyze probe results, find ttl to gfw ===
 
 def handle_time_exceeded(ip_packet):
     global MAX_TTL_TO_GFW
@@ -180,36 +230,62 @@ def handle_time_exceeded(ip_packet):
         LOGGER.info('slide ttl range to [%s ~ %s]' % (MIN_TTL_TO_GFW, MAX_TTL_TO_GFW))
         RANGE_OF_TTL_TO_GFW = range(MIN_TTL_TO_GFW, MAX_TTL_TO_GFW + 1)
 
+# === HTTP REQUEST: buffer or scramble ===
 
-class ProbeResult(object):
-    def __init__(self):
-        super(ProbeResult, self).__init__()
-        self.started_at = time.time()
-        self.routers = {} # ttl => (router_ip, is_china_router)
+def handle_http_request(ip_packet):
+    ttl_to_gfw = probed_ttls.get(ip_packet.dst_ip)
+    if not ttl_to_gfw:
+        buffered_http_requests[(ip_packet.dst_ip, ip_packet.tcp.seq)] = ip_packet
+        return
+    buffered_http_requests.pop((ip_packet.dst_ip, ip_packet.tcp.seq), None)
+    inject_scrambled_http_get_to_let_gfw_miss_keyword(ip_packet, ip_packet.pos_host, ttl_to_gfw)
 
-    def analyze_ttl_to_gfw(self, exact_match_only=True):
-        max_china_ttl = None
-        if self.routers.get(MAX_TTL_TO_GFW):
-            router_ip, is_china_router = self.routers.get(MAX_TTL_TO_GFW)
-            if is_china_router:
-                LOGGER.info('max ttl is still in china: %s, %s' % (MAX_TTL_TO_GFW, router_ip))
-                return MAX_TTL_TO_GFW
-        for ttl in sorted(self.routers.keys()):
-            next = self.routers.get(ttl + 1)
-            if next is None:
-                continue
-                # ttl 8 is china, ttl 9 is not
-            _, current_is_china_router = self.routers[ttl]
-            _, next_is_china_router = next
-            # then we think 8 is the ttl to gfw
-            if current_is_china_router:
-                max_china_ttl = ttl
-                if not next_is_china_router:
-                    return ttl
-        if exact_match_only:
-            return None
-        else:
-            return max_china_ttl
+
+def inject_scrambled_http_get_to_let_gfw_miss_keyword(ip_packet, pos_host, ttl_to_gfw):
+# we still need to make the keyword less obvious by splitting the packet into two
+# to make it harder to rebuilt the stream, we injected two more fake packets to poison the stream
+# first_packet .. fake_second_packet => GFW ? wrong
+# fake_first_packet .. second_packet => GFW ? wrong
+# first_packet .. second_packet => server ? yes, it is a HTTP GET
+    global scrambled_ips
+    scrambled_ips.append(ip_packet.dst_ip)
+    if len(scrambled_ips) == 20:
+        LOGGER.info('scrambled: %s' % set(scrambled_ips))
+        scrambled_ips = []
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug('inject scrambled http reqeust: %s %s' % (ip_packet.dst_ip, ttl_to_gfw))
+    first_part = ip_packet.tcp.data[:pos_host]
+    second_part = ip_packet.tcp.data[pos_host:]
+
+    second_packet = dpkt.ip.IP(str(ip_packet))
+    second_packet.ttl = 255
+    second_packet.tcp.seq += len(first_part)
+    second_packet.tcp.data = second_part
+    second_packet.sum = 0
+    second_packet.tcp.sum = 0
+    raw_socket.sendto(str(second_packet), (ip_packet.dst_ip, 0))
+
+    fake_first_packet = dpkt.ip.IP(str(ip_packet))
+    fake_first_packet.ttl = ttl_to_gfw
+    fake_first_packet.tcp.data = (len(first_part) + 10) * '0'
+    fake_first_packet.sum = 0
+    fake_first_packet.tcp.sum = 0
+    raw_socket.sendto(str(fake_first_packet), (ip_packet.dst_ip, 0))
+
+    fake_second_packet = dpkt.ip.IP(str(ip_packet))
+    fake_second_packet.ttl = ttl_to_gfw
+    fake_second_packet.tcp.seq += len(first_part) + 10
+    fake_second_packet.tcp.data = ': baidu.com\r\n\r\n'
+    fake_second_packet.sum = 0
+    fake_second_packet.tcp.sum = 0
+    raw_socket.sendto(str(fake_second_packet), (ip_packet.dst_ip, 0))
+
+    first_packet = dpkt.ip.IP(str(ip_packet))
+    first_packet.ttl = 255
+    first_packet.tcp.data = first_part
+    first_packet.sum = 0
+    first_packet.tcp.sum = 0
+    raw_socket.sendto(str(first_packet), (ip_packet.dst_ip, 0))
 
 
 if '__main__' == __name__:
