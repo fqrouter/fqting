@@ -140,7 +140,12 @@ def handle_packet(nfqueue_element):
                     return
                 pos_host = ip_packet.tcp.data.find('Host:')
                 if pos_host != -1:
-                    ip_packet.pos_host = pos_host + len('Host')
+                    ip_packet.pos_host = pos_host + len('Host:')
+                    line_ended_at =  ip_packet.tcp.data.find('\r\n', ip_packet.pos_host)
+                    if line_ended_at == -1:
+                        ip_packet.pos_host += 6
+                    else:
+                        ip_packet.pos_host += ((line_ended_at - ip_packet.pos_host) / 2)
                     handle_http_request(ip_packet)
                     nfqueue_element.drop()
                     return
