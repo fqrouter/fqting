@@ -119,6 +119,9 @@ def handle_packet(nfqueue_element):
         if fqsocks.lan_ip.is_lan_traffic(ip_packet.src_ip, ip_packet.dst_ip):
             nfqueue_element.accept()
             return
+        if ip_packet.dst_ip.startswith('203.208.46.') or ip_packet.src_ip.startswith('203.208.46.'): # guxiang
+            nfqueue_element.accept()
+            return
         if hasattr(ip_packet, 'tcp'):
             if dpkt.tcp.TH_SYN & ip_packet.tcp.flags and dpkt.tcp.TH_ACK & ip_packet.tcp.flags:
                 handle_syn_ack(ip_packet)
