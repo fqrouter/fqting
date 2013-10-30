@@ -119,7 +119,7 @@ def handle_packet(nfqueue_element):
         if fqsocks.lan_ip.is_lan_traffic(ip_packet.src_ip, ip_packet.dst_ip):
             nfqueue_element.accept()
             return
-        if ip_packet.dst_ip.startswith('203.208.46.') or ip_packet.src_ip.startswith('203.208.46.'): # guxiang
+        if ip_packet.dst_ip.startswith('203.208.') or ip_packet.src_ip.startswith('203.208.'): # guxiang
             nfqueue_element.accept()
             return
         if hasattr(ip_packet, 'tcp'):
